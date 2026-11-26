@@ -8,6 +8,7 @@
 // The mixes and the embedding are ModelCore's decode kernels (per-row CTAs, any row count). Ablation of the
 // attention / MLP writes happens inside the mixes that consume them, as in the decode step.
 #include "model/prefill.h"
+#include "model/secondary_device.h"
 
 #include "core/device.h"
 #include "ingine/generator.h"
@@ -41,9 +42,69 @@ std::vector<const float*> blocks_of(int l, int p, const float* B0, const float* 
 
 }  // namespace
 
+// Eager two-device reference path. Only activations and routing metadata cross PCIe.
+// Synchronous host staging also works on WSL devices without peer access.
+class Prefiller::RemoteExperts {
+ public:
+  explicit RemoteExperts(int capacity)
+      : staging_(std::size_t(capacity) * (H * 2 + TOP_K * 8) + EXPERTS * sizeof(int)) {
+    OnSecondary device;
+    const std::size_t rows = capacity, pairs = rows * TOP_K;
+    x_ = DeviceBuffer(rows * H * 2);
+    indices_ = DeviceBuffer(pairs * sizeof(int));
+    weights_ = DeviceBuffer(pairs * sizeof(float));
+    counts_ = DeviceBuffer(EXPERTS * sizeof(int));
+    ntiles_ = DeviceBuffer(sizeof(int));
+    tiles_ = DeviceBuffer(pk::moe_tiles_capacity(capacity) * sizeof(int4));
+    token_ = DeviceBuffer(pairs * sizeof(int));
+    dest_ = DeviceBuffer(pairs * sizeof(int));
+    act_ = DeviceBuffer(pairs * INTER * 2);
+    down_ = DeviceBuffer(pairs * H * 2);
+    out_ = DeviceBuffer(rows * H * 2);
+  }
+
+  void run(const pk::MoeExperts& experts, int rows, const void* x, const int* idx,
+           const float* weights, const int* counts, void* result, cudaStream_t primary_stream) {
+    const std::size_t row_bytes = std::size_t(rows) * H * 2;
+    const std::size_t pair_bytes = std::size_t(rows) * TOP_K * sizeof(int);
+    auto* data = static_cast<std::byte*>(staging_.data());
+    auto* host_idx = data + row_bytes;
+    auto* host_weights = host_idx + pair_bytes;
+    auto* host_counts = host_weights + pair_bytes;
+    CUDA_CHECK(cudaMemcpyAsync(data, x, row_bytes, cudaMemcpyDeviceToHost, primary_stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_idx, idx, pair_bytes, cudaMemcpyDeviceToHost, primary_stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_weights, weights, pair_bytes, cudaMemcpyDeviceToHost, primary_stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_counts, counts, counts_.bytes, cudaMemcpyDeviceToHost, primary_stream));
+    CUDA_CHECK(cudaStreamSynchronize(primary_stream));
+    {
+      OnSecondary device;
+      CUDA_CHECK(cudaMemcpyAsync(x_.p, data, row_bytes, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpyAsync(indices_.p, host_idx, pair_bytes, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpyAsync(weights_.p, host_weights, pair_bytes, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpyAsync(counts_.p, host_counts, counts_.bytes, cudaMemcpyHostToDevice));
+      const pk::MoeWork work{static_cast<int*>(counts_.p), static_cast<int*>(ntiles_.p),
+                             static_cast<int4*>(tiles_.p), static_cast<int*>(token_.p), static_cast<int*>(dest_.p)};
+      pk::moe_route(static_cast<int*>(indices_.p), rows, work, nullptr);
+      pk::moe_gate_up(experts, bf(x_), rows, work, bf(act_), nullptr);
+      pk::moe_down(experts, bf(act_), rows, work, bf(down_), nullptr);
+      pk::moe_combine(bf(down_), static_cast<float*>(weights_.p), rows, bf(out_), nullptr);
+      CUDA_CHECK(cudaMemcpyAsync(data, out_.p, row_bytes, cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(result, data, row_bytes, cudaMemcpyHostToDevice, primary_stream));
+  }
+
+ private:
+  static __nv_bfloat16* bf(DeviceBuffer& buffer) { return static_cast<__nv_bfloat16*>(buffer.p); }
+  PinnedHostBuffer staging_;
+  DeviceBuffer x_, indices_, weights_, counts_, ntiles_, tiles_, token_, dest_, act_, down_, out_;
+};
+
 Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream)
     : w_(w), abl_(abl), max_chunk_(max_chunk), stream_(stream), gemm_(std::make_unique<pk::Gemm>()) {
   if (max_chunk < 1) throw std::invalid_argument("Prefiller: max_chunk must be positive");
+  if (std::any_of(w.layers.begin(), w.layers.end(), [](const Layer& l) { return l.experts.device == 1; }))
+    remote_ = std::make_unique<RemoteExperts>(max_chunk);
   const int L = WINDOW + max_chunk;
   kpos_rows_ = (L + pk::kAttnKeyTile - 1) / pk::kAttnKeyTile * pk::kAttnKeyTile;
   if (kpos_rows_ / pk::kAttnKeyTile > pk::kAttnMaxTiles)
@@ -308,13 +369,17 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), s));
     pk::moe_topk(router_logits_, f32p(layer.router_bias), T, idx_, wts_, counts_, s);
     const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
-    pk::moe_route(idx_, T, work, s);
     const Experts& ex = layer.experts;
     const pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,
                             f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
-    pk::moe_gate_up(me, xm_, T, work, act_, s);
-    pk::moe_down(me, act_, T, work, down_, s);
-    pk::moe_combine(down_, wts_, T, moe_sum_, s);
+    if (ex.device == 1) {
+      remote_->run(me, T, xm_, idx_, wts_, counts_, moe_sum_, s);
+    } else {
+      pk::moe_route(idx_, T, work, s);
+      pk::moe_gate_up(me, xm_, T, work, act_, s);
+      pk::moe_down(me, act_, T, work, down_, s);
+      pk::moe_combine(down_, wts_, T, moe_sum_, s);
+    }
     pk::static_conv(moe_sum_, H, T, H, f32p(layer.mlp_conv), st.conv_mlp_at(v), y2_, s);
     pk::conv_state_update(st.conv_mlp_at(v), moe_sum_, H, T, H, s);
     prev_v = v;

@@ -1,5 +1,25 @@
 # Inkling-2-Mini abliterated: ingine
 
+## Two Blackwell GPUs
+
+This fork adds a text-serving profile for two RTX 5060 Ti 16 GB cards under WSL2. The attention layers, router and KV cache run on GPU 0. GPU 1 holds and executes the routed experts starting at the selected layer. Hidden states, routing metadata and combined outputs travel through host RAM. CUDA peer access is optional. The split path currently uses eager single-token decoding with the prefill kernels. DSpark and the upstream RTX 5090 speed figures apply to the single-GPU profile.
+
+From a checkout of this fork, build and launch the original Inkling model with
+
+~~~bash
+export INGINE_EXPERT_SPLIT_LAYER=8
+export INGINE_ABLATION=''
+bash setup.sh                         # choose 1 to build and download the pinned files
+PORT=19554 bash scripts/ingine serve
+~~~
+
+Run `python3 tools/check_split_sql.py` to verify a generated query against a SQLite fixture through the API.
+
+Use a lower split layer to leave more space on GPU 0. Stop the server before changing the split. To measure a full 262,144-token prompt plus output, configure extra context headroom with INGINE_CTX=263232. For the upstream single-GPU profile, unset INGINE_EXPERT_SPLIT_LAYER.
+
+## Upstream project
+
+
 An abliterated [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) served
 by **ingine**, a custom CUDA inference engine for one RTX 5090. It answers harmful test prompts instead of refusing
 them, directly and after reasoning (refusal phrases in 1 of 104 and 3 of 48 answers, the 3 followed by the requested

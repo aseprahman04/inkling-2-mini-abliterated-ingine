@@ -134,6 +134,7 @@ enum class ExpertFormat : int { NVFP4 = 0, MXFP8 = 1 };  // the moe kernels' `fm
 
 // weights.Experts (checkpoint encoding; see weights.py docstring)
 struct Experts {
+    int device = -1;  // -1 means resident on the primary device
   ExpertFormat fmt = ExpertFormat::NVFP4;
   // NVFP4: w13 u8 [128, 2304, 1152], w13_scale e4m3 [128, 2304, 144], w2 u8 [128, 2304, 576],
   //        w2_scale e4m3 [128, 2304, 72], factors fp32 [128] (amax / outer_scale_denominator)

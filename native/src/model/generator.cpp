@@ -133,7 +133,26 @@ class EngineGenerator final : public Generator {
           spec_->generate(token, max_new_tokens, sampling, rng, stop_ids, on_tokens, stats, tokens_in_state_);
         }
       } else {
-        decode(n, max_new_tokens, sampling, rng, stop_ids, on_tokens, stats, t);
+        if (options_.expert_split_layer < LAYERS) {
+          for (int i = 0; i < max_new_tokens; ++i) {
+            int token = sample(static_cast<const float*>(logits_.p), sampling, rng);
+            if (!sampling.forced.empty()) token = sampling.forced[i];
+            if (i == 0) {
+              stats.prefill_seconds = seconds_since(t);
+              t = std::chrono::steady_clock::now();
+            }
+            stats.generated_tokens = i + 1;
+            const std::int32_t out[]{token};
+            if (!on_tokens(out) || std::find(stop_ids.begin(), stop_ids.end(), token) != stop_ids.end() ||
+                i + 1 == max_new_tokens) break;
+            CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, &token, sizeof(token), cudaMemcpyHostToDevice, rt_.stream()));
+            prefiller_.run(rt_.state(), static_cast<const std::int32_t*>(chunk_tokens_.p), 1, n + i,
+                           static_cast<float*>(logits_.p), nullptr);
+            tokens_in_state_.push_back(token);
+          }
+        } else {
+          decode(n, max_new_tokens, sampling, rng, stop_ids, on_tokens, stats, t);
+        }
       }
       CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
     } catch (...) {

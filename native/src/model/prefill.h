@@ -57,6 +57,8 @@ class Prefiller {
   const Ablation& abl_;
   int max_chunk_;
   cudaStream_t stream_;
+  class RemoteExperts;
+  std::unique_ptr<RemoteExperts> remote_;
   std::unique_ptr<kernels::prefill::Gemm> gemm_;
   std::vector<DeviceBuffer> storage_;
   std::map<std::vector<const float*>, DeviceBuffer> tables_;

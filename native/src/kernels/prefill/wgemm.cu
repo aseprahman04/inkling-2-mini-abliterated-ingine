@@ -281,10 +281,18 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
 template <int FMT, Mode MODE, int K, int TM>
 void launch(const GemmArgs& g, int grid, cudaStream_t stream) {
   constexpr int SMEM = Cfg<FMT, K, TM>::SMEM;
-  static const cudaError_t attr =
-      cudaFuncSetAttribute(wgemm_kernel<FMT, MODE, K, TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-  if (attr != cudaSuccess) throw std::runtime_error("prefill wgemm: shared memory attribute failed");
+  // The dynamic shared-memory limit belongs to the kernel on the current device.
+  static thread_local int last_device = -1;
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess) throw std::runtime_error("prefill wgemm: cannot query device");
+  if (device != last_device) {
+    const auto err = cudaFuncSetAttribute(wgemm_kernel<FMT, MODE, K, TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    if (err != cudaSuccess) throw std::runtime_error("prefill wgemm: shared memory attribute failed");
+    last_device = device;
+  }
   wgemm_kernel<FMT, MODE, K, TM><<<grid, NT, SMEM, stream>>>(g);
+  if (auto err = cudaGetLastError(); err != cudaSuccess)
+    throw std::runtime_error(std::string("prefill wgemm launch: ") + cudaGetErrorString(err));
 }
 
 template <int FMT, Mode MODE, int K>

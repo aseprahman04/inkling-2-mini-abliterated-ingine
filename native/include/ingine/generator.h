@@ -97,6 +97,7 @@ struct RuntimeOptions {
   int park_mb = -1;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
+  int expert_split_layer = 24;  // [0, 24); later layers run routed experts on GPU 1. 24 keeps one GPU.
 };
 
 class Generator {

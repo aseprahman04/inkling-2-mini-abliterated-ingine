@@ -84,6 +84,9 @@ int main(int argc, char** argv) {
   ap.option("--ablation", "", "ablation file (safetensors) applied at every visit", &ablation);
   ap.option("--max-ctx", "", "positions held by the full-attention caches", &max_ctx);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
+  int expert_split_layer = 24, prefill_chunk = 3072;
+  ap.option("--expert-split-layer", "", "run experts from this layer on GPU 1 (0..23); default 24 uses one GPU", &expert_split_layer);
+  ap.option("--prefill-chunk", "", "maximum tokens per prefill chunk", &prefill_chunk);
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
@@ -144,6 +147,8 @@ int main(int argc, char** argv) {
       options.ablation = ablation;
       options.max_ctx = max_ctx;
       options.dense_fp8 = dense_fp8;
+      options.expert_split_layer = expert_split_layer;
+      options.prefill_chunk = prefill_chunk;
       options.kv_fp8 = kv_fp8;
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);

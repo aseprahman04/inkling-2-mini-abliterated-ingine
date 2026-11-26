@@ -63,8 +63,12 @@ void GraphExec::launch(cudaStream_t stream) const {
 
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
+  if (options.expert_split_layer < 0 || options.expert_split_layer > LAYERS)
+    throw std::invalid_argument("expert split layer must be between 0 and 24");
+  if (options.expert_split_layer < LAYERS && options.spec)
+    throw std::invalid_argument("dual-GPU expert split currently supports plain decoding only");
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_);
+  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_, options.expert_split_layer);
   ablation_ = load_ablation(options.ablation);
   init();
 }
@@ -79,6 +83,7 @@ Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablati
 void Runtime::init() {
   const RuntimeOptions& options = options_;
   state_ = make_state(options.max_ctx, options.kv_fp8);
+  if (options.expert_split_layer < LAYERS) return;  // This path uses the prefiller for all token steps.
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
   pos_ = DeviceBuffer(sizeof(std::int64_t));
   pos_.fill(0);

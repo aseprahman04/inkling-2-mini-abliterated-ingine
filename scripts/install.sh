@@ -101,7 +101,11 @@ if [[ "$MODE" != download ]]; then
   driver_major="${driver%%.*}"
   [[ "$driver_major" =~ ^[0-9]+$ ]] || fail "Cannot read the NVIDIA driver version from nvidia-smi ($driver)."
   (( driver_major >= MIN_DRIVER )) || fail "NVIDIA driver $driver is too old: ingine is built with CUDA 13, which needs driver $MIN_DRIVER or newer. Update the driver, then rerun."
-  if ! awk -F', ' -v min="$MIN_GPU_MIB" '$3 == "12.0" && $4 + 0 >= min {found = 1} END {exit !found}' <<< "$gpus"; then
+  if [[ -n "${INGINE_EXPERT_SPLIT_LAYER:-}" ]]; then
+    [[ "$INGINE_EXPERT_SPLIT_LAYER" =~ ^([0-9]|1[0-9]|2[0-3])$ ]] || fail 'INGINE_EXPERT_SPLIT_LAYER must be 0..23.'
+    awk -F', ' '$3 == "12.0" && $4 + 0 >= 15360 {n++} END {exit n < 2}' <<< "$gpus" ||
+      confirm 'Two-device profile tested with two 16 GiB compute capability 12.0 GPUs. Check available memory before serving.'
+  elif ! awk -F', ' -v min="$MIN_GPU_MIB" '$3 == "12.0" && $4 + 0 >= min {found = 1} END {exit !found}' <<< "$gpus"; then
     confirm 'ingine targets a 32 GB RTX 5090 (compute capability 12.0, sm_120a); its kernels do not run on other GPUs, and the served 262,144-token context needs about 31 GiB of GPU memory.'
   fi
 fi

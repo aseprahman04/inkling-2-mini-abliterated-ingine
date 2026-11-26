@@ -37,6 +37,7 @@ Settings: environment variables, or shell assignments in $CONFIG (the environmen
   INGINE_ABLATION       ablation file (default <model folder>/inkling-2-mini-abliterated.safetensors, downloaded
                         with the model); set it empty (INGINE_ABLATION=) to serve the original model as inkling-2-mini
   HOST, PORT            bind address (default 127.0.0.1, 8003)
+  INGINE_EXPERT_SPLIT_LAYER  first expert layer on GPU 1 (0..23); selects the two-GPU text profile
   INGINE_CTX            context length in tokens (default 262144)
   INGINE_EXTRA_ARGS     extra server flags, split on whitespace (e.g. "--spec-threshold 0.7")
   INGINE_START_TIMEOUT  seconds start waits for /health (default 300)
@@ -73,7 +74,7 @@ case "${1:-help}" in
 esac
 
 # ---- settings: config file, then the environment on top ----------------------------------------------
-VARS=(INGINE_MODEL_DIR INGINE_ABLATION HOST PORT INGINE_CTX INGINE_EXTRA_ARGS INGINE_START_TIMEOUT)
+VARS=(INGINE_EXPERT_SPLIT_LAYER INGINE_MODEL_DIR INGINE_ABLATION HOST PORT INGINE_CTX INGINE_EXTRA_ARGS INGINE_START_TIMEOUT)
 declare -A explicit=()
 for name in "${VARS[@]}"; do
   if [[ -v $name ]]; then explicit[$name]="${!name}"; fi
@@ -169,8 +170,13 @@ or set INGINE_ABLATION= (empty) to serve the original model."
 # ---- commands -------------------------------------------------------------------------------------
 cmd_serve() {
   check_install
-  local args=(--engine --model-dir "$INGINE_MODEL_DIR" --host "$HOST" --port "$PORT" --max-ctx "$INGINE_CTX"
-              "${profile_flags[@]}")
+  local args=(--engine --model-dir "$INGINE_MODEL_DIR" --host "$HOST" --port "$PORT" --max-ctx "$INGINE_CTX")
+  if [[ -n "${INGINE_EXPERT_SPLIT_LAYER:-}" ]]; then
+    [[ "$INGINE_EXPERT_SPLIT_LAYER" =~ ^([0-9]|1[0-9]|2[0-3])$ ]] || die "INGINE_EXPERT_SPLIT_LAYER must be 0..23."
+    args+=(--expert-split-layer "$INGINE_EXPERT_SPLIT_LAYER" --dense-fp8 --kv-fp8 --no-vision --prefill-chunk 1024)
+  else
+    args+=("${profile_flags[@]}")
+  fi
   if [[ -n "$INGINE_ABLATION" ]]; then args+=(--ablation "$INGINE_ABLATION" --model-id "$profile_model_id"); fi
   local extra=()
   read -r -a extra <<< "$INGINE_EXTRA_ARGS"

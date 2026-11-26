@@ -7,6 +7,7 @@
 // Large tensors are uploaded straight from the file with the core DeviceUploader; small per-channel
 // parameters are read on the host, widened to FP32 (exact from BF16) and copied.
 #include "model/runtime.h"
+#include "model/secondary_device.h"
 
 #include "core/device.h"
 #include "core/safetensors.h"
@@ -18,6 +19,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -166,7 +168,33 @@ Dense row_view(const Dense& d, int begin, int end) {
   return v;
 }
 
-Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
+// Load routed experts in their checkpoint encoding onto the current device.
+void load_experts(Loader& ld, const std::string& e, Layer& layer, ExpertFormat fmt) {
+  const SafetensorsModel& m = ld.model();
+  Experts& ex = layer.experts;
+  ex.fmt = fmt;
+  ex.w13 = ld.raw(e + "w13_weight");
+  ex.w13_scale = ld.raw(e + "w13_weight_scale");
+  ex.w2 = ld.raw(e + "w2_weight");
+  ex.w2_scale = ld.raw(e + "w2_weight_scale");
+  const bool nv = fmt == ExpertFormat::NVFP4;
+  const std::string want_codes = nv ? "U8" : "F8_E4M3", want_scales = nv ? "F8_E4M3" : "U8";
+  if (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
+      m.at(e + "w2_weight")->dtype != want_codes || m.at(e + "w2_weight_scale")->dtype != want_scales)
+    throw std::runtime_error("weights: layer " + std::to_string(layer.idx) + " experts do not match their format");
+  if (nv) {
+    for (const char* w : {"w13", "w2"}) {
+      const std::vector<float> amax = host_f32(m, e + w + "_weight_amax");
+      const std::vector<float> den = host_f32(m, e + w + "_weight_outer_scale_denominator");
+      std::vector<float> f(EXPERTS);
+      for (int i = 0; i < EXPERTS; ++i) f[i] = amax[i] / den[den.size() == 1 ? 0 : i];  // FP32 division
+      (std::string(w) == "w13" ? ex.w13_factor : ex.w2_factor) = ld.upload_f32(f, {EXPERTS});
+    }
+  }
+
+}
+
+Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, Loader* remote = nullptr) {
   const SafetensorsModel& m = ld.model();
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   Layer layer;
@@ -292,27 +320,14 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
     layer.mlp_gate_gain = at(layer.mlp1_gate_gain, 0, DType::FP32, H, GATE_RANK);
   }
 
-  // routed experts in checkpoint encoding
-  const std::string e = p + "mlp.experts.";
-  Experts& ex = layer.experts;
-  ex.fmt = fmt;
-  ex.w13 = ld.raw(e + "w13_weight");
-  ex.w13_scale = ld.raw(e + "w13_weight_scale");
-  ex.w2 = ld.raw(e + "w2_weight");
-  ex.w2_scale = ld.raw(e + "w2_weight_scale");
-  const bool nv = fmt == ExpertFormat::NVFP4;
-  const std::string want_codes = nv ? "U8" : "F8_E4M3", want_scales = nv ? "F8_E4M3" : "U8";
-  if (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
-      m.at(e + "w2_weight")->dtype != want_codes || m.at(e + "w2_weight_scale")->dtype != want_scales)
-    throw std::runtime_error("weights: layer " + std::to_string(l) + " experts do not match their format");
-  if (nv) {
-    for (const char* w : {"w13", "w2"}) {
-      const std::vector<float> amax = host_f32(m, e + w + "_weight_amax");
-      const std::vector<float> den = host_f32(m, e + w + "_weight_outer_scale_denominator");
-      std::vector<float> f(EXPERTS);
-      for (int i = 0; i < EXPERTS; ++i) f[i] = amax[i] / den[den.size() == 1 ? 0 : i];  // FP32 division
-      (std::string(w) == "w13" ? ex.w13_factor : ex.w2_factor) = ld.upload_f32(f, {EXPERTS});
-    }
+  const std::string prefix = p + "mlp.experts.";
+  if (remote) {
+    OnSecondary device;
+    layer.experts.device = 1;
+    load_experts(*remote, prefix, layer, fmt);
+    remote->flush();
+  } else {
+    load_experts(ld, prefix, layer, fmt);
   }
 
   ld.flush();
@@ -332,7 +347,7 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
 
 }  // namespace
 
-Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream) {
+Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream, int split_from) {
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;
@@ -341,7 +356,22 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   w.storage.reserve(4096);
   Loader ld(m, up, stream, w.storage);
   const int H = HIDDEN;
-  for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8));
+  std::unique_ptr<DeviceUploader> remote_upload;
+  std::unique_ptr<Loader> remote;
+  if (split_from < LAYERS) {
+    int primary = -1, count = 0;
+    CUDA_CHECK(cudaGetDevice(&primary));
+    CUDA_CHECK(cudaGetDeviceCount(&count));
+    if (count < 2 || primary != 0 || split_from < 0)
+      throw std::invalid_argument("split expert loading requires primary GPU 0 and secondary GPU 1");
+    OnSecondary device;
+    remote_upload = std::make_unique<DeviceUploader>();
+    remote = std::make_unique<Loader>(m, *remote_upload, nullptr, w.storage);
+  }
+  for (int l = 0; l < LAYERS; ++l) {
+    w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8,
+                                       l >= split_from ? remote.get() : nullptr));
+  }
 
   // message_queries [12, 4, H] = cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1) with queries and
   // kv_queries [24, H] unflattened to [12, 2, H]
