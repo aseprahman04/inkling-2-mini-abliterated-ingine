@@ -33,6 +33,7 @@ def main():
         db.execute("CREATE TABLE users(name TEXT, score INTEGER)")
         db.executemany("INSERT INTO users VALUES (?,?)",
                        [("Z", 10), ("A", 10), ("C", 9), ("B", 11), ("N", None)])
+        db.commit()
         db.execute("PRAGMA query_only=ON")
         db.set_authorizer(lambda action, *_: sqlite3.SQLITE_OK if action in
                           (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ) else sqlite3.SQLITE_DENY)
